@@ -45,20 +45,14 @@ class SingleEquationExtractor:
 
     def extract(self, img: Image.Image, timeout: float = 25.0) -> Optional[str]:
         try:
-            import signal
-            def _run():
-                return self._model(img)
-            def _handler(signum, frame):
-                raise TimeoutError()
-            old = signal.signal(signal.SIGALRM, _handler)
-            signal.alarm(int(timeout))
-            result = _run()
-            signal.alarm(0)
-            signal.signal(signal.SIGALRM, old)
+            from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                future = pool.submit(self._model, img)
+                result = future.result(timeout=timeout)
             if result and self._is_valid(result):
                 return result
             return None
-        except Exception:
+        except (FuturesTimeout, Exception):
             return None
 
     def _is_valid(self, latex: str) -> bool:
@@ -117,14 +111,18 @@ class SingleEquationExtractor:
         greek_count = sum(1 for m in GREEK if m in latex)
         braces_ok = abs(latex.count('{') - latex.count('}')) <= 3
 
+        # Count strong signals that are NOT just accents or font wrappers
+        non_trivial = set(STRONG) - set(ACCENTS_ONLY) - set(WRAPPERS) - set(TEXT_WRAPPERS)
+        real_math_count = sum(1 for m in non_trivial if m in latex)
+
         if strong_count >= 1 and braces_ok:
             if has_operator:
                 return True  # Has real operator → accept
-            if strong_count >= 2:
-                return True  # 2+ strong commands → accept
-            # Accent-only or text-wrapper → REJECT (formatting, not math)
-            if accent_only_count >= 1 or text_wrapper_count >= 1:
+            # Only accents + wrappers → NOT math (e.g. \mathrm{\hat{t}})
+            if real_math_count == 0:
                 return False
+            if strong_count >= 2:
+                return True  # 2+ strong commands with real math → accept
             if wrapper_count >= 1:
                 return True  # Math wrappers → accept
             return False
@@ -234,9 +232,9 @@ def _find_equation_candidates(img: Image.Image) -> List[dict]:
         aspect = cw / max(ch, 1)
 
         # Filter by size and shape
-        if area < 500 or area > w * h * 0.7:
+        if area < 1500 or area > w * h * 0.7:
             continue
-        if cw < 30 or ch < 15:
+        if cw < 50 or ch < 15:
             continue
         # Equations are usually wider than tall or roughly square
         if aspect < 0.3 or aspect > 12:
@@ -317,6 +315,12 @@ def detect_equations_multi(img: Image.Image, timeout: float = 25.0) -> List[dict
     for cand in candidates:
         latex = extractor.extract(cand['crop'], timeout=timeout)
         if latex:
+            # Reject hallucinations: tiny regions producing overly complex LaTeX
+            bbox = cand['bbox']
+            crop_area = (bbox[2] - bbox[0]) * (bbox[3] - bbox[1])
+            cmd_count = latex.count('\\')
+            if crop_area < 2000 and cmd_count > 5:
+                continue  # Small region with complex output → likely hallucination
             results.append({
                 'latex': latex,
                 'bbox': cand['bbox'],
@@ -382,6 +386,17 @@ def compare_equations_multi(img1: Image.Image, img2: Image.Image,
     # Greedy matching: pair each eq1 to nearest unmatched eq2 within row tolerance
     row_tolerance = max(img1.height, img2.height) * 0.15  # 15% row tolerance
 
+    def _normalize_latex(s: str) -> str:
+        """Normalize LaTeX for comparison — strip non-semantic whitespace commands."""
+        import re
+        s = s.strip()
+        # Remove trailing/leading thin-space commands that pix2tex adds non-deterministically
+        s = re.sub(r'(?:\\[,;!]|\s)+$', '', s)
+        s = re.sub(r'^(?:\\[,;!]|\s)+', '', s)
+        # Collapse internal whitespace commands to single space
+        s = re.sub(r'(?:\\[,;!]|\s)+', ' ', s)
+        return s
+
     for i1, e1 in sorted1:
         best_j = None
         best_dist = float('inf')
@@ -398,7 +413,7 @@ def compare_equations_multi(img1: Image.Image, img2: Image.Image,
         if best_j is not None:
             used1.add(i1)
             used2.add(best_j)
-            same = eqs1[i1]['latex'].strip() == eqs2[best_j]['latex'].strip()
+            same = _normalize_latex(eqs1[i1]['latex']) == _normalize_latex(eqs2[best_j]['latex'])
             pairings.append((i1, best_j, same))
 
     unpaired1 = [eqs1[i] for i in range(count1) if i not in used1]

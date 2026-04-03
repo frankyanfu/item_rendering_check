@@ -6,27 +6,34 @@ Each layer supports multiple items per image and detects asymmetry
 Fully local — no LLM API required.
 """
 
-import click, csv
+import click, csv, logging
 from pathlib import Path
-from screenshot_diff.comparator import compare
-from screenshot_diff.text_diff import extract_text
-from screenshot_diff.equation import detect_equations_multi
+from .comparator import compare
+from .text_diff import extract_text
+from .equation import detect_equations_multi
 
 
 @click.group()
-def cli():
+@click.option('--verbose', '-v', is_flag=True, help='Enable debug logging')
+def cli(verbose):
     """Screenshot diff — compare screenshots by text, equations, tables, and graphs."""
-    pass
+    level = logging.DEBUG if verbose else logging.WARNING
+    logging.basicConfig(
+        level=level,
+        format='%(asctime)s %(name)s %(levelname)s: %(message)s',
+        datefmt='%H:%M:%S',
+    )
 
 
 @cli.command()
 @click.argument('path1', type=click.Path(exists=True))
 @click.argument('path2', type=click.Path(exists=True))
 @click.option('--ocr-lang', default=None, type=str)
+@click.option('--no-visual', is_flag=True, help='Skip pixel-level visual diff')
 @click.option('--no-tables', is_flag=True, help='Skip table detection')
 @click.option('--no-graphs', is_flag=True, help='Skip chart/graph detection')
 @click.option('--json', 'as_json', is_flag=True, help='Output results as JSON')
-def compare_cmd(path1, path2, ocr_lang, no_tables, no_graphs, as_json):
+def compare_cmd(path1, path2, ocr_lang, no_visual, no_tables, no_graphs, as_json):
     """Compare two screenshots across all content layers."""
     result = compare(
         path1, path2,
@@ -34,32 +41,33 @@ def compare_cmd(path1, path2, ocr_lang, no_tables, no_graphs, as_json):
         detect_equations=True,
         detect_tables=not no_tables,
         detect_graphs=not no_graphs,
+        detect_visual=not no_visual,
     )
 
     if as_json:
         import json
-        def _safe(v):
-            if hasattr(v, 'item'):
-                return v.item()
-            return v
         def _to_serializable(obj):
             if isinstance(obj, (str, int, float, bool, type(None))):
                 return obj
-            if isinstance(obj, (list, tuple)):
-                return [_safe(x) for x in obj]
+            if hasattr(obj, 'item'):
+                return obj.item()
             if isinstance(obj, dict):
-                return {k: _safe(v) for k, v in obj.items()}
+                return {k: _to_serializable(v) for k, v in obj.items()}
+            if isinstance(obj, (list, tuple)):
+                return [_to_serializable(x) for x in obj]
             return str(obj)
-        click.echo(json.dumps({k: _to_serializable(v) for k, v in result.items()}, indent=2, default=str))
+        click.echo(json.dumps(_to_serializable(result), indent=2, default=str))
         return
 
     verdict_colors = {
-        'identical': 'green', 'text_diff': 'yellow', 'equation_diff': 'yellow',
-        'table_diff': 'yellow', 'graph_diff': 'yellow', 'multiple_diff': 'red'
+        'identical': 'green', 'visual_diff': 'yellow', 'text_diff': 'yellow',
+        'equation_diff': 'yellow', 'table_diff': 'yellow', 'graph_diff': 'yellow',
+        'multiple_diff': 'red'
     }
     color = verdict_colors.get(result['verdict'], 'white')
     icon = '✓' if result['same'] else '✗'
 
+    vis = result.get('visual_result')
     tr = result.get('text_result') or {}
     eq = result.get('equation_result')
     tbl = result.get('table_result')
@@ -73,6 +81,30 @@ def compare_cmd(path1, path2, ocr_lang, no_tables, no_graphs, as_json):
     click.echo(f"{'-'*60}")
     click.secho(f"  {icon} Verdict: {result['verdict'].upper()}", fg=color, bold=True)
     click.echo(f"  {result['summary']}")
+    conf = result.get('confidence', 0)
+    lc = result.get('layer_confidence', {})
+    conf_parts = [f"{k}={v:.0%}" for k, v in lc.items() if v > 0]
+    click.echo(f"  Confidence: {conf:.0%}  ({', '.join(conf_parts)})")
+    click.echo()
+
+    # ── Visual ─────────────────────────────────────────────────────────────
+    if vis:
+        click.echo(f"  --- Visual (SSIM + perceptual hash) ---")
+        ssim = vis.get('ssim_score', 0)
+        hash_sim = vis.get('quick_result', {}).get('overall_hash_similarity', 0)
+        n_regions = vis.get('num_changed_regions', 0)
+        click.echo(f"  SSIM: {ssim:.4f}  |  Hash similarity: {hash_sim:.1%}")
+        if vis.get('is_different'):
+            click.secho(f"  ✗ Visually different — {n_regions} changed region(s)", fg='yellow')
+            for i, region in enumerate(vis.get('changed_regions', [])[:5]):
+                click.echo(f"    #{i+1}: {region['width']}x{region['height']} at ({region['x']},{region['y']}), "
+                           f"intensity={region['mean_intensity']:.3f}")
+            if n_regions > 5:
+                click.echo(f"    ... and {n_regions - 5} more region(s)")
+        else:
+            click.secho(f"  ✓ Visually identical", fg='green')
+    else:
+        click.echo(f"  --- Visual ---  (detection disabled)")
     click.echo()
 
     # ── Text ───────────────────────────────────────────────────────────────
@@ -181,10 +213,15 @@ def compare_cmd(path1, path2, ocr_lang, no_tables, no_graphs, as_json):
 @click.argument('input_csv', type=click.Path(exists=True))
 @click.option('--output-csv', '-o', type=click.Path())
 @click.option('--ocr-lang', default=None, type=str)
+@click.option('--no-visual', is_flag=True)
 @click.option('--no-tables', is_flag=True)
 @click.option('--no-graphs', is_flag=True)
-def batch(input_csv, output_csv, ocr_lang, no_tables, no_graphs):
-    """Batch compare image pairs from CSV. Output: verdict + 3 similarity columns."""
+@click.option('--resume', is_flag=True, help='Skip rows already present in output CSV')
+@click.option('--workers', '-w', default=1, type=int, help='Number of parallel workers (default: 1)')
+def batch(input_csv, output_csv, ocr_lang, no_visual, no_tables, no_graphs, resume, workers):
+    """Batch compare image pairs from CSV. Output: verdict + similarity columns."""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
     input_path = Path(input_csv)
     output_path = Path(output_csv) if output_csv else input_path.parent / f"{input_path.stem}_results.csv"
 
@@ -198,72 +235,79 @@ def batch(input_csv, output_csv, ocr_lang, no_tables, no_graphs):
         click.secho(f"✗ Could not detect before/after columns. Found: {fieldnames}", fg='red')
         raise click.Abort()
 
-    click.echo(f"Processing {len(rows)} image pair(s)...")
-    results = []
+    # Resume: load existing results to skip already-processed pairs
+    done_keys: set = set()
+    existing_results: list = []
+    if resume and output_path.exists():
+        with open(output_path, 'r', newline='', encoding='utf-8') as f:
+            for r in csv.DictReader(f):
+                key = (r.get('before_path', ''), r.get('after_path', ''))
+                if r.get('verdict') and r['verdict'] != 'ERROR':
+                    done_keys.add(key)
+                    existing_results.append(r)
+        if done_keys:
+            click.echo(f"Resuming: {len(done_keys)} pair(s) already processed, skipping.")
 
+    # Build work items (only rows not yet done)
+    work = []
     for i, row in enumerate(rows):
         bp = row[col_before].strip()
         ap = row[col_after].strip()
-        if not Path(bp).exists():
-            click.secho(f"  [{i+1}/{len(rows)}] ✗ Not found: {bp}", fg='red')
-            results.append(_error_row(bp, ap, f"File not found: {bp}"))
+        if resume and (bp, ap) in done_keys:
             continue
-        if not Path(ap).exists():
-            click.secho(f"  [{i+1}/{len(rows)}] ✗ Not found: {ap}", fg='red')
-            results.append(_error_row(bp, ap, f"File not found: {ap}"))
-            continue
+        work.append((i, bp, ap))
 
+    total = len(rows)
+    click.echo(f"Processing {len(work)} image pair(s) (of {total} total)...")
+
+    results = list(existing_results)
+
+    def _process_one(idx, bp, ap):
+        """Compare one pair and return a result dict."""
+        if not Path(bp).exists():
+            return _error_row(bp, ap, f"File not found: {bp}")
+        if not Path(ap).exists():
+            return _error_row(bp, ap, f"File not found: {ap}")
         try:
             r = compare(bp, ap, ocr_lang=ocr_lang,
                         detect_equations=True,
                         detect_tables=not no_tables,
-                        detect_graphs=not no_graphs)
-
-            tr = r.get('text_result') or {}
-            eq = r.get('equation_result')
-            tbl = r.get('table_result')
-            gr = r.get('graph_result')
-
-            # Text similarity
-            text_sim = tr.get('similarity', '')
-
-            # Table similarity
-            tbl_sim = _table_similarity(tbl)
-
-            # Graph similarity
-            gr_sim = _graph_similarity(gr)
-
-            verdict_icon = '✓' if r['same'] else '✗'
-            color = 'green' if r['same'] else 'yellow'
-            ts = f'{text_sim:.0%}' if isinstance(text_sim, float) else str(text_sim or 'N/A')
-            t_str = f'{tbl_sim:.0%}' if isinstance(tbl_sim, float) else str(tbl_sim or 'N/A')
-            g_str = f'{gr_sim:.0%}' if isinstance(gr_sim, float) else str(gr_sim or 'N/A')
-            eq_str = "eq:{}/{}".format(eq.get("count1",0), eq.get("count2",0)) if eq else ""
-
-            click.secho(
-                f"  [{i+1}/{len(rows)}] {verdict_icon} {Path(bp).name} → {r['verdict']}  "
-                f"(text={ts}, table={t_str}, graph={g_str}{', '+eq_str if eq_str else ''})",
-                fg=color
-            )
-
-            results.append({
-                'before_path': bp, 'after_path': ap,
-                'verdict': r['verdict'], 'same': r['same'],
-                'text_similarity': text_sim,
-                'table_similarity': tbl_sim,
-                'graph_similarity': gr_sim,
-                'eq_count': '{}/{}'.format(eq.get('count1',0), eq.get('count2',0)) if eq else '0/0',
-                'table_count': '{}/{}'.format(tbl.get('count1',0), tbl.get('count2',0)) if tbl else '0/0',
-                'graph_count': '{}/{}'.format(gr.get('count1',0), gr.get('count2',0)) if gr else '0/0',
-                'summary': r['summary'],
-            })
+                        detect_graphs=not no_graphs,
+                        detect_visual=not no_visual)
+            return _build_result_row(r, bp, ap)
         except Exception as e:
-            click.secho(f"  [{i+1}/{len(rows)}] ✗ Error: {e}", fg='red')
-            results.append(_error_row(bp, ap, str(e)))
+            return _error_row(bp, ap, str(e))
+
+    if workers > 1:
+        # Parallel execution
+        futures = {}
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            for idx, bp, ap in work:
+                fut = pool.submit(_process_one, idx, bp, ap)
+                futures[fut] = (idx, bp, ap)
+
+            with click.progressbar(length=len(work), label='Comparing') as bar:
+                for fut in as_completed(futures):
+                    idx, bp, ap = futures[fut]
+                    result_row = fut.result()
+                    results.append(result_row)
+                    icon = '✓' if result_row.get('same') is True else '✗'
+                    color = 'green' if result_row.get('same') is True else ('red' if result_row.get('verdict') == 'ERROR' else 'yellow')
+                    click.secho(f"  [{idx+1}/{total}] {icon} {Path(bp).name} → {result_row['verdict']}", fg=color)
+                    bar.update(1)
+    else:
+        # Sequential with progress bar
+        with click.progressbar(work, label='Comparing', item_show_func=lambda x: Path(x[1]).name if x else '') as bar:
+            for idx, bp, ap in bar:
+                result_row = _process_one(idx, bp, ap)
+                results.append(result_row)
+                icon = '✓' if result_row.get('same') is True else '✗'
+                color = 'green' if result_row.get('same') is True else ('red' if result_row.get('verdict') == 'ERROR' else 'yellow')
+                click.secho(f"  [{idx+1}/{total}] {icon} {Path(bp).name} → {result_row['verdict']}", fg=color)
 
     fieldnames_out = [
-        'before_path', 'after_path', 'verdict', 'same',
-        'text_similarity', 'table_similarity', 'graph_similarity',
+        'before_path', 'after_path', 'verdict', 'same', 'confidence',
+        'visual_ssim', 'text_similarity', 'table_similarity', 'graph_similarity',
         'eq_count', 'table_count', 'graph_count', 'summary'
     ]
     with open(output_path, 'w', newline='', encoding='utf-8') as f:
@@ -306,7 +350,7 @@ def extract(path, ocr_lang):
 
     click.echo(f"\n  --- Tables ---")
     try:
-        from screenshot_diff.table import detect_tables_multi
+        from .table import detect_tables_multi
         def ocr_fn(crop):
             return pytesseract.image_to_string(crop, lang=ocr_lang or 'eng', config='--psm 7').strip()
         tables = detect_tables_multi(img, ocr_func=ocr_fn)
@@ -341,9 +385,32 @@ def _detect_columns(fieldnames):
 def _error_row(bp, ap, error_msg):
     return {
         'before_path': bp, 'after_path': ap,
-        'verdict': 'ERROR', 'same': '',
-        'text_similarity': '', 'table_similarity': '', 'graph_similarity': '',
+        'verdict': 'ERROR', 'same': '', 'confidence': '',
+        'visual_ssim': '', 'text_similarity': '', 'table_similarity': '',
+        'graph_similarity': '',
         'eq_count': '', 'table_count': '', 'graph_count': '', 'summary': error_msg,
+    }
+
+
+def _build_result_row(r, bp, ap):
+    """Build a flat result dict from compare() output for CSV."""
+    vis = r.get('visual_result')
+    tr = r.get('text_result') or {}
+    eq = r.get('equation_result')
+    tbl = r.get('table_result')
+    gr = r.get('graph_result')
+    return {
+        'before_path': bp, 'after_path': ap,
+        'verdict': r['verdict'], 'same': r['same'],
+        'confidence': r.get('confidence', ''),
+        'visual_ssim': vis.get('ssim_score', '') if vis else '',
+        'text_similarity': tr.get('similarity', ''),
+        'table_similarity': _table_similarity(tbl),
+        'graph_similarity': _graph_similarity(gr),
+        'eq_count': '{}/{}'.format(eq.get('count1', 0), eq.get('count2', 0)) if eq else '0/0',
+        'table_count': '{}/{}'.format(tbl.get('count1', 0), tbl.get('count2', 0)) if tbl else '0/0',
+        'graph_count': '{}/{}'.format(gr.get('count1', 0), gr.get('count2', 0)) if gr else '0/0',
+        'summary': r['summary'],
     }
 
 

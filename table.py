@@ -5,10 +5,13 @@ Detects multiple tables per image by clustering grid line regions spatially.
 No LLM required — fully local.
 """
 
+import logging
 import cv2
 import numpy as np
 from PIL import Image
 from typing import Optional, List, Tuple
+
+logger = logging.getLogger(__name__)
 
 
 def detect_table_grid(img: Image.Image, min_line_length: int = 50) -> Optional[dict]:
@@ -68,13 +71,14 @@ def extract_table_cells(img: Image.Image, grid: dict, ocr_func=None) -> List[Lis
     v_lines = grid['vertical_lines']
     rows = []
 
-    for i in range(len(h_lines) + 1):
-        y_top = h_lines[i - 1][1] if i > 0 else 0
-        y_bot = h_lines[i][1] if i < len(h_lines) else img.height
+    # Only extract cells between adjacent grid lines (not above/below/left/right of borders)
+    for i in range(len(h_lines) - 1):
+        y_top = h_lines[i][1]
+        y_bot = h_lines[i + 1][1]
         row_cells = []
-        for j in range(len(v_lines) + 1):
-            x_left = v_lines[j - 1][0] if j > 0 else 0
-            x_right = v_lines[j][0] if j < len(v_lines) else img.width
+        for j in range(len(v_lines) - 1):
+            x_left = v_lines[j][0]
+            x_right = v_lines[j + 1][0]
             pad = 3
             x_left = max(0, x_left + pad)
             y_top = max(0, y_top + pad)
@@ -99,84 +103,127 @@ def _table_to_csv(rows: List[List[str]]) -> str:
 
 def _grid_bboxes_from_lines(img: Image.Image) -> List[dict]:
     """
-    Find all grid clusters in the image.
-    Returns list of grid dicts, each with its own lines, bbox, and cell data.
+    Find all grid clusters in the image using morphological line extraction
+    and connected component analysis.
+
+    Uses directional erosion/dilation to isolate long horizontal and vertical
+    lines, then groups them into separate grid structures using connected
+    components. This separates table grids from equation/chart box borders.
     """
     arr = np.array(img.convert('L'))
-    blurred = cv2.GaussianBlur(arr, (5, 5), 0)
-    edges = cv2.Canny(blurred, 50, 150, apertureSize=3)
-    lines = cv2.HoughLinesP(edges, rho=1, theta=np.pi / 180, threshold=30,
-                             minLineLength=50, maxLineGap=10)
+    binary = cv2.adaptiveThreshold(
+        arr, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 15, 5
+    )
 
-    if lines is None:
-        return []
+    # --- Extract horizontal lines using a long horizontal kernel ---
+    h_kernel_len = max(80, img.width // 5)
+    h_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (h_kernel_len, 1))
+    h_mask = cv2.morphologyEx(binary, cv2.MORPH_OPEN, h_kernel, iterations=1)
 
-    horizontal = []
-    vertical = []
-    for line in lines:
-        x1, y1, x2, y2 = line[0]
-        angle = abs(np.arctan2(y2 - y1, x2 - x1) * 180 / np.pi)
-        if angle < 5:
-            horizontal.append((x1, y2, x2, y2))
-        elif 85 < angle < 95:
-            vertical.append((x1, y1, x2, y2))
+    # --- Extract vertical lines using a long vertical kernel ---
+    v_kernel_len = max(40, img.height // 8)
+    v_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, v_kernel_len))
+    v_mask = cv2.morphologyEx(binary, cv2.MORPH_OPEN, v_kernel, iterations=1)
 
-    if not horizontal or not vertical:
-        return []
+    # --- Combine and find connected grid structures ---
+    # Dilate slightly so lines that touch at corners connect into one component
+    dilate_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+    combined = cv2.bitwise_or(h_mask, v_mask)
+    combined_dilated = cv2.dilate(combined, dilate_kernel, iterations=1)
 
-    # Cluster horizontal lines into row bands (group by y-proximity)
-    def cluster_by_y(lines_list, y_tolerance=15):
-        if not lines_list:
-            return []
-        lines_list = sorted(lines_list, key=lambda l: l[1])
-        clusters = []
-        current_cluster = [lines_list[0]]
-        for line in lines_list[1:]:
-            if abs(line[1] - current_cluster[-1][1]) <= y_tolerance:
-                current_cluster.append(line)
-            else:
-                clusters.append(current_cluster)
-                current_cluster = [line]
-        clusters.append(current_cluster)
-        return clusters
-
-    h_clusters = cluster_by_y(horizontal, y_tolerance=15)
-    v_clusters = cluster_by_y(vertical, y_tolerance=10)
+    num_labels, labels = cv2.connectedComponents(combined_dilated)
 
     grids = []
+    for label_id in range(1, num_labels):
+        component_mask = (labels == label_id).astype(np.uint8) * 255
 
-    for h_grp in h_clusters:
-        h_grp = sorted(h_grp, key=lambda l: l[1])
-        for v_grp in v_clusters:
-            v_grp = sorted(v_grp, key=lambda l: l[0])
-            # Try forming a grid from these clusters
-            y_top = min(l[1] for l in h_grp)
-            y_bot = max(l[3] for l in h_grp)
-            x_left = min(l[0] for l in v_grp)
-            x_right = max(l[2] for l in v_grp)
-            w = x_right - x_left
-            h = y_bot - y_top
-            if w < 80 or h < 40:
-                continue
-            rows_in_grp = len(h_grp)
-            cols_in_grp = len(v_grp)
-            if rows_in_grp >= 2 and cols_in_grp >= 2:
-                grids.append({
-                    'horizontal_lines': h_grp,
-                    'vertical_lines': v_grp,
-                    'num_rows': rows_in_grp + 1,
-                    'num_cols': cols_in_grp + 1,
-                    'bbox': {'x1': int(x_left), 'y1': int(y_top),
-                              'x2': int(x_right), 'y2': int(y_bot)},
-                })
+        # Extract h/v lines that belong to this component
+        h_component = cv2.bitwise_and(h_mask, h_mask, mask=component_mask)
+        v_component = cv2.bitwise_and(v_mask, v_mask, mask=component_mask)
 
-    # If clustering didn't work, fall back to single global grid
-    if not grids:
-        g = detect_table_grid(img)
-        if g:
-            grids.append(g)
+        # Find line positions via projection within this component
+        h_proj = np.sum(h_component, axis=1)
+        v_proj = np.sum(v_component, axis=0)
+
+        h_threshold = img.width * 0.08
+        v_threshold = img.height * 0.03
+
+        h_positions = _find_line_positions(h_proj, h_threshold, tolerance=5)
+        v_positions = _find_line_positions(v_proj, v_threshold, tolerance=5)
+
+        # A table needs at least 3 horizontal and 3 vertical lines
+        # (2 borders + at least 1 internal separator in each direction)
+        if len(h_positions) < 3 or len(v_positions) < 3:
+            continue
+
+        # Determine actual line extents from the component masks
+        horizontal = []
+        for y_pos in h_positions:
+            row = h_component[y_pos, :]
+            nonzero = np.where(row > 0)[0]
+            if len(nonzero) > 0:
+                horizontal.append((int(nonzero[0]), y_pos, int(nonzero[-1]), y_pos))
+
+        vertical = []
+        for x_pos in v_positions:
+            col = v_component[:, x_pos]
+            nonzero = np.where(col > 0)[0]
+            if len(nonzero) > 0:
+                vertical.append((x_pos, int(nonzero[0]), x_pos, int(nonzero[-1])))
+
+        if len(horizontal) < 3 or len(vertical) < 3:
+            continue
+
+        # Length filter: keep lines >=50% of the longest in this component
+        max_h_len = max(abs(l[2] - l[0]) for l in horizontal)
+        horizontal = [l for l in horizontal if abs(l[2] - l[0]) >= max_h_len * 0.5]
+        max_v_len = max(abs(l[3] - l[1]) for l in vertical)
+        vertical = [l for l in vertical if abs(l[3] - l[1]) >= max_v_len * 0.5]
+
+        if len(horizontal) < 3 or len(vertical) < 3:
+            continue
+
+        horizontal = sorted(horizontal, key=lambda l: l[1])
+        vertical = sorted(vertical, key=lambda l: l[0])
+
+        y_top = min(l[1] for l in horizontal)
+        y_bot = max(l[3] for l in horizontal)
+        x_left = min(l[0] for l in vertical)
+        x_right = max(l[2] for l in vertical)
+
+        if (x_right - x_left) < 80 or (y_bot - y_top) < 40:
+            continue
+
+        grids.append({
+            'horizontal_lines': horizontal,
+            'vertical_lines': vertical,
+            'num_rows': max(1, len(horizontal) - 1),
+            'num_cols': max(1, len(vertical) - 1),
+            'bbox': {'x1': int(x_left), 'y1': int(y_top),
+                     'x2': int(x_right), 'y2': int(y_bot)},
+        })
 
     return grids
+
+
+def _find_line_positions(projection: np.ndarray, threshold: float,
+                         tolerance: int = 5) -> List[int]:
+    """Find line positions from a projection profile.
+    Groups nearby high-value positions and returns one position per group."""
+    above = np.where(projection > threshold)[0]
+    if len(above) == 0:
+        return []
+    groups: List[List[int]] = []
+    current_group = [above[0]]
+    for pos in above[1:]:
+        if pos - current_group[-1] <= tolerance:
+            current_group.append(pos)
+        else:
+            groups.append(current_group)
+            current_group = [pos]
+    groups.append(current_group)
+    # Return the midpoint of each group
+    return [int(np.mean(g)) for g in groups]
 
 
 def detect_tables_multi(img: Image.Image, ocr_func=None) -> List[dict]:

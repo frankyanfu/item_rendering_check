@@ -3,9 +3,12 @@ Region detection — find bounding boxes around changed areas in a diff map.
 Uses OpenCV contour detection on a thresholded diff map.
 """
 
+import logging
 import cv2
 import numpy as np
 from PIL import Image
+
+logger = logging.getLogger(__name__)
 
 
 def find_changed_regions(
@@ -26,8 +29,10 @@ def find_changed_regions(
     Returns:
         List of dicts with keys: x, y, width, height, area, mean_intensity
     """
-    # Threshold the blurred diff to create binary mask
-    _, binary = cv2.threshold(blurred_diff.astype(np.float32), threshold, 255, cv2.THRESH_BINARY)
+    # SSIM diff_map has 1.0 = identical, 0.0 = maximally different.
+    # Invert so that changed pixels have HIGH values.
+    inv_diff = (1.0 - blurred_diff).astype(np.float32)
+    _, binary = cv2.threshold(inv_diff, threshold, 255, cv2.THRESH_BINARY)
     binary_uint8 = binary.astype(np.uint8)
 
     # Morphological close to merge nearby blobs

@@ -3,10 +3,13 @@ OCR-based text extraction and comparison.
 Uses Tesseract (local) — no API required.
 """
 
+import logging
 import pytesseract
 from PIL import Image
 import difflib
 from typing import Optional
+
+logger = logging.getLogger(__name__)
 
 
 def extract_text(img: Image.Image, lang: Optional[str] = None) -> str:
@@ -19,10 +22,10 @@ def extract_text(img: Image.Image, lang: Optional[str] = None) -> str:
     Returns:
         Extracted text as string (may be empty if nothing detected)
     """
-    config = ''
+    kwargs = {}
     if lang:
-        config = f'-l {lang}'
-    text = pytesseract.image_to_string(img, config=config)
+        kwargs['lang'] = lang
+    text = pytesseract.image_to_string(img, **kwargs)
     return text.strip()
 
 
