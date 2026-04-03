@@ -1,0 +1,6 @@
+Pillow>=10.0.0
+pytesseract>=0.3.10
+click>=8.1.0
+opencv-python>=4.9.0.0
+pix2tex>=0.1.4
+numpy>=1.26.0
